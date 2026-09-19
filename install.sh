@@ -48,7 +48,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$INTERVAL_MINUTES" in ''|*[!0-9]*) printf 'Invalid interval: %s\n' "$INTERVAL_MINUTES" >&2; exit 2 ;; esac
-[ "$INTERVAL_MINUTES" -ge 1 ] && [ "$INTERVAL_MINUTES" -le 59 ] || { printf 'Interval must be between 1 and 59.\n' >&2; exit 2; }
+if [ "$INTERVAL_MINUTES" -lt 1 ] || [ "$INTERVAL_MINUTES" -gt 59 ]; then
+    printf 'Interval must be between 1 and 59.\n' >&2
+    exit 2
+fi
 case "$REPO_DIR" in /*) ;; *) REPO_DIR="$PWD/$REPO_DIR" ;; esac
 
 if [ "$(uname -s)" != Linux ]; then
