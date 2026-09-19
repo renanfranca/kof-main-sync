@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PROGRAM="kof-main-sync"
+VERSION="0.1.0"
+MARKER="# kof-main-sync"
+DEFAULT_UPSTREAM_REPO="KofLang/Kof4j"
+DEFAULT_BRANCH="main"
+DEFAULT_INTERVAL="5"
+PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.sdkman/candidates/maven/current/bin:${HOME}/.sdkman/candidates/java/current/bin"
+export PATH
+umask 077
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONFIG_FILE="${KOF_MAIN_SYNC_CONFIG:-$CONFIG_HOME/$PROGRAM/config}"
+STATE_DIR="${KOF_MAIN_SYNC_STATE_DIR:-$STATE_HOME/$PROGRAM}"
+LOG_FILE="$STATE_DIR/sync.log"
+LOCK_FILE="$STATE_DIR/sync.lock"
+INSTALL_STATE="$STATE_DIR/installed.state"
+GH_BIN="${KOF_MAIN_SYNC_GH_BIN:-gh}"
+CRONTAB_BIN="${KOF_MAIN_SYNC_CRONTAB_BIN:-crontab}"
+
+REPO_DIR="$HOME/projects/kof"
+UPSTREAM_REPO="$DEFAULT_UPSTREAM_REPO"
+ORIGIN_REPO=""
+BRANCH="$DEFAULT_BRANCH"
+INSTALL_KOF="true"
+INTERVAL_MINUTES="$DEFAULT_INTERVAL"
+KOF_DATA_DIR="$DATA_HOME/kof"
+KOF_BIN_LINK="$HOME/.local/bin/kof"
+
+usage() {
+    cat <<EOF
+$PROGRAM $VERSION
+
+Usage:
+  $PROGRAM --help
+  $PROGRAM install
+  $PROGRAM uninstall
+  $PROGRAM status
+  $PROGRAM run [--dry-run]
+  $PROGRAM rollback
+  $PROGRAM logs [--follow]
+EOF
+}
+
+timestamp() { date --iso-8601=seconds; }
+
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    touch "$LOG_FILE" "$LOCK_FILE"
+    chmod 600 "$LOG_FILE" "$LOCK_FILE"
+}
+
+rotate_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    local size
+    size=$(stat -c %s "$LOG_FILE" 2>/dev/null || printf '0')
+    [ "$size" -lt 5242880 ] && return 0
+    local index
+    if [ -f "$LOG_FILE.5" ]; then
+        rm -f -- "$LOG_FILE.5"
+    fi
+    for index in 4 3 2 1; do
+        if [ -f "$LOG_FILE.$index" ]; then
+            mv -- "$LOG_FILE.$index" "$LOG_FILE.$((index + 1))"
+        fi
+    done
+    mv -- "$LOG_FILE" "$LOG_FILE.1"
+    : > "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+}
+
+log() {
+    ensure_state_dir
+    rotate_log
+    printf '%s pid=%s %s\n' "$(timestamp)" "$$" "$*" >> "$LOG_FILE"
+}
+
+die() {
+    log "level=error message=$(printf '%q' "$*")"
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    return 20
+}
+
+parse_bool() {
+    case "$1" in
+        true|false) printf '%s\n' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || {
+        printf '%s: configuration not found: %s\n' "$PROGRAM" "$CONFIG_FILE" >&2
+        printf 'Run the repository install.sh first.\n' >&2
+        return 20
+    }
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) printf '%s: invalid configuration line: %s\n' "$PROGRAM" "$line" >&2; return 20 ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            REPO_DIR) REPO_DIR=$value ;;
+            UPSTREAM_REPO) UPSTREAM_REPO=$value ;;
+            ORIGIN_REPO) ORIGIN_REPO=$value ;;
+            BRANCH) BRANCH=$value ;;
+            INSTALL_KOF) INSTALL_KOF=$(parse_bool "$value") || return 20 ;;
+            INTERVAL_MINUTES) INTERVAL_MINUTES=$value ;;
+            KOF_DATA_DIR) KOF_DATA_DIR=$value ;;
+            KOF_BIN_LINK) KOF_BIN_LINK=$value ;;
+            *) printf '%s: unknown configuration key: %s\n' "$PROGRAM" "$key" >&2; return 20 ;;
+        esac
+    done < "$CONFIG_FILE"
+    case "$INTERVAL_MINUTES" in
+        ''|*[!0-9]*) return 20 ;;
+    esac
+    [ "$INTERVAL_MINUTES" -ge 1 ] && [ "$INTERVAL_MINUTES" -le 59 ] || return 20
+}
+
+require_commands() {
+    local command_name missing=0
+    for command_name in bash git flock "$CRONTAB_BIN" curl tar sha256sum awk sed stat mktemp; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            printf '%s: missing dependency: %s\n' "$PROGRAM" "$command_name" >&2
+            missing=1
+        fi
+    done
+    if [ -n "$ORIGIN_REPO" ] || [ "$INSTALL_KOF" = true ]; then
+        if ! command -v "$GH_BIN" >/dev/null 2>&1; then
+            printf '%s: missing dependency: %s\n' "$PROGRAM" "$GH_BIN" >&2
+            missing=1
+        fi
+    fi
+    [ "$missing" -eq 0 ] || return 20
+}
+
+git_dir_path() {
+    local path
+    path=$(git -C "$REPO_DIR" rev-parse --git-dir) || return 1
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *) printf '%s/%s\n' "$REPO_DIR" "$path" ;;
+    esac
+}
+
+operation_in_progress() {
+    local git_dir marker
+    git_dir=$(git_dir_path) || return 0
+    for marker in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+        [ ! -e "$git_dir/$marker" ] || return 0
+    done
+    [ ! -d "$git_dir/rebase-merge" ] || return 0
+    [ ! -d "$git_dir/rebase-apply" ] || return 0
+    return 1
+}
+
+validate_checkout() {
+    [ -d "$REPO_DIR/.git" ] || die "not a Git checkout: $REPO_DIR" || return
+    local branch
+    branch=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null) || {
+        log "phase=checkout result=skipped reason=detached-head"
+        return 10
+    }
+    [ "$branch" = "$BRANCH" ] || {
+        log "phase=checkout result=skipped reason=wrong-branch branch=$branch"
+        return 10
+    }
+    [ -z "$(git -C "$REPO_DIR" status --porcelain)" ] || {
+        log "phase=checkout result=skipped reason=dirty-tree"
+        return 10
+    }
+    if operation_in_progress; then
+        log "phase=checkout result=skipped reason=git-operation-in-progress"
+        return 10
+    fi
+    local upstream_url
+    upstream_url=$(git -C "$REPO_DIR" remote get-url upstream 2>/dev/null) || die "missing upstream remote" || return
+    if [ "${KOF_MAIN_SYNC_TEST_MODE:-0}" != 1 ]; then
+        case "$upstream_url" in
+            "https://github.com/$UPSTREAM_REPO.git"|"git@github.com:$UPSTREAM_REPO.git"|"https://github.com/$UPSTREAM_REPO") ;;
+            *) die "unexpected upstream URL: $upstream_url" || return ;;
+        esac
+    fi
+    if [ -n "$ORIGIN_REPO" ]; then
+        local origin_url
+        origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null) || die "missing origin remote" || return
+        if [ "${KOF_MAIN_SYNC_TEST_MODE:-0}" != 1 ]; then
+            case "$origin_url" in
+                "https://github.com/$ORIGIN_REPO.git"|"git@github.com:$ORIGIN_REPO.git"|"https://github.com/$ORIGIN_REPO") ;;
+                *) die "unexpected origin URL: $origin_url" || return ;;
+            esac
+        fi
+    fi
+}
+
+sync_checkout() {
+    local dry_run=$1
+    validate_checkout || return $?
+    git -C "$REPO_DIR" fetch --no-tags upstream \
+        "refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        log "phase=checkout result=error reason=fetch-upstream"
+        return 20
+    }
+    local local_sha upstream_sha
+    local_sha=$(git -C "$REPO_DIR" rev-parse "refs/heads/$BRANCH") || return 20
+    upstream_sha=$(git -C "$REPO_DIR" rev-parse "refs/remotes/upstream/$BRANCH") || return 20
+    if [ "$local_sha" = "$upstream_sha" ]; then
+        log "phase=checkout result=current sha=$local_sha"
+        printf 'Checkout/documentation already current: %s\n' "$local_sha"
+        SYNCED_SHA=$upstream_sha
+        return 0
+    fi
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor "$local_sha" "$upstream_sha"; then
+        log "phase=checkout result=skipped reason=local-exclusive-or-diverged local=$local_sha upstream=$upstream_sha"
+        return 10
+    fi
+    if [ "$dry_run" = true ]; then
+        log "phase=checkout result=dry-run from=$local_sha to=$upstream_sha"
+        printf 'Would fast-forward checkout: %s -> %s\n' "$local_sha" "$upstream_sha"
+        SYNCED_SHA=$upstream_sha
+        return 0
+    fi
+    validate_checkout || return $?
+    [ "$(git -C "$REPO_DIR" rev-parse "refs/heads/$BRANCH")" = "$local_sha" ] || {
+        log "phase=checkout result=skipped reason=head-changed"
+        return 10
+    }
+    git -C "$REPO_DIR" merge --ff-only "refs/remotes/upstream/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        log "phase=checkout result=error reason=fast-forward"
+        return 20
+    }
+    SYNCED_SHA=$(git -C "$REPO_DIR" rev-parse "refs/heads/$BRANCH")
+    log "phase=checkout result=updated from=$local_sha to=$SYNCED_SHA"
+    printf 'Updated checkout/documentation: %s -> %s\n' "$local_sha" "$SYNCED_SHA"
+}
+
+sync_origin() {
+    local dry_run=$1 target_sha=$2
+    if [ -z "$ORIGIN_REPO" ]; then
+        log "phase=origin result=disabled"
+        printf 'Origin synchronization disabled.\n'
+        return 0
+    fi
+    git -C "$REPO_DIR" fetch --no-tags origin \
+        "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        log "phase=origin result=error reason=fetch-origin"
+        return 20
+    }
+    local origin_sha
+    origin_sha=$(git -C "$REPO_DIR" rev-parse "refs/remotes/origin/$BRANCH") || return 20
+    if [ "$origin_sha" = "$target_sha" ]; then
+        log "phase=origin result=current sha=$origin_sha"
+        printf 'Origin already current: %s\n' "$origin_sha"
+        return 0
+    fi
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor "$origin_sha" "$target_sha"; then
+        log "phase=origin result=skipped reason=ahead-or-diverged origin=$origin_sha target=$target_sha"
+        return 10
+    fi
+    if [ "$dry_run" = true ]; then
+        log "phase=origin result=dry-run from=$origin_sha to=$target_sha"
+        printf 'Would fast-forward origin: %s -> %s\n' "$origin_sha" "$target_sha"
+        return 0
+    fi
+    git -C "$REPO_DIR" push origin \
+        "refs/heads/$BRANCH:refs/heads/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        log "phase=origin result=error reason=push-rejected"
+        return 20
+    }
+    local verified_sha
+    verified_sha=$(git -C "$REPO_DIR" ls-remote origin "refs/heads/$BRANCH" | awk 'NR == 1 {print $1}') || return 20
+    [ "$verified_sha" = "$target_sha" ] || {
+        log "phase=origin result=error reason=verification expected=$target_sha actual=${verified_sha:-missing}"
+        return 20
+    }
+    log "phase=origin result=updated from=$origin_sha to=$target_sha"
+    printf 'Updated origin: %s -> %s\n' "$origin_sha" "$target_sha"
+}
+
+resolved_remote_tag_sha() {
+    local tag=$1 direct peeled
+    direct=$(git -C "$REPO_DIR" ls-remote upstream "refs/tags/$tag" | awk 'NR == 1 {print $1}') || return 1
+    peeled=$(git -C "$REPO_DIR" ls-remote upstream "refs/tags/$tag^{}" | awk 'NR == 1 {print $1}') || return 1
+    printf '%s\n' "${peeled:-$direct}"
+}
+
+safe_archive() {
+    local archive=$1 expected_root=$2
+    tar -tzf "$archive" | awk -v root="$expected_root" '
+        BEGIN { ok = 1; seen = 0 }
+        /^\// { ok = 0 }
+        { n = split($0, parts, "/"); for (i = 1; i <= n; i++) if (parts[i] == "..") ok = 0 }
+        index($0, root "/") == 1 || $0 == root { seen = 1; next }
+        { ok = 0 }
+        END { exit !(ok && seen) }
+    '
+}
+
+cleanup_staging() {
+    local staging=$1
+    case "$staging" in
+        "$KOF_DATA_DIR"/.staging.*) rm -rf -- "$staging" ;;
+        *) log "phase=install result=error reason=unsafe-staging-cleanup path=$staging"; return 20 ;;
+    esac
+}
+
+prepare_release() {
+    local staging=$1 tag=$2 dist_name=$3 version=$4
+    "$GH_BIN" release download "$tag" --repo "$UPSTREAM_REPO" \
+        --pattern "$dist_name.tar.gz" --pattern SHA256SUMS --dir "$staging" >> "$LOG_FILE" 2>&1 || return 1
+    (cd "$staging" && sha256sum -c SHA256SUMS) >> "$LOG_FILE" 2>&1 || return 2
+    if [ "${KOF_MAIN_SYNC_TEST_MODE:-0}" != 1 ]; then
+        local published_digest actual_digest
+        published_digest=$("$GH_BIN" api "repos/$UPSTREAM_REPO/releases/tags/$tag" \
+            --jq ".assets[] | select(.name == \"$dist_name.tar.gz\") | .digest // \"\"" 2>/dev/null || true)
+        if [ -n "$published_digest" ]; then
+            actual_digest="sha256:$(sha256sum "$staging/$dist_name.tar.gz" | awk '{print $1}')"
+            [ "$published_digest" = "$actual_digest" ] || return 3
+        fi
+    fi
+    safe_archive "$staging/$dist_name.tar.gz" "$dist_name" || return 4
+    tar -xzf "$staging/$dist_name.tar.gz" -C "$staging" || return 5
+    local extracted="$staging/$dist_name"
+    [ -x "$extracted/bin/kof" ] && [ -f "$extracted/lib/kof.jar" ] && \
+        [ -f "$extracted/VERSION" ] && [ -x "$extracted/jdk/bin/java" ] || return 6
+    [ "$(tr -d '\r\n' < "$extracted/VERSION")" = "$version" ] || return 7
+    [ "$("$extracted/bin/kof" version 2>/dev/null)" = "kof $version" ] || return 8
+    "$extracted/bin/kof" info 2>/dev/null | grep -q '(embedded)' || return 9
+}
+
+write_install_state() {
+    local active_path=$1 active_sha=$2 active_version=$3 active_tag=$4 previous_path=$5 previous_sha=$6 previous_version=$7
+    ensure_state_dir
+    local temp_state
+    temp_state=$(mktemp "$STATE_DIR/installed.state.XXXXXX") || return 20
+    {
+        printf 'ACTIVE_PATH=%s\n' "$active_path"
+        printf 'ACTIVE_SHA=%s\n' "$active_sha"
+        printf 'ACTIVE_VERSION=%s\n' "$active_version"
+        printf 'ACTIVE_TAG=%s\n' "$active_tag"
+        printf 'PREVIOUS_PATH=%s\n' "$previous_path"
+        printf 'PREVIOUS_SHA=%s\n' "$previous_sha"
+        printf 'PREVIOUS_VERSION=%s\n' "$previous_version"
+        printf 'UPDATED_AT=%s\n' "$(timestamp)"
+    } > "$temp_state"
+    chmod 600 "$temp_state"
+    mv -f -- "$temp_state" "$INSTALL_STATE"
+}
+
+state_value() {
+    local key=$1 file=${2:-$INSTALL_STATE}
+    [ -f "$file" ] || return 1
+    sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+activate_installation() {
+    local install_path=$1 sha=$2 version=$3 tag=$4
+    local current_path="" previous_sha="" previous_version=""
+    if [ -L "$KOF_BIN_LINK" ]; then
+        current_path=$(dirname "$(dirname "$(readlink -f "$KOF_BIN_LINK")")")
+    elif [ -e "$KOF_BIN_LINK" ]; then
+        die "refusing to replace non-symlink: $KOF_BIN_LINK" || return
+    fi
+    if [ "$current_path" = "$install_path" ]; then
+        log "phase=install result=current version=$version sha=$sha"
+        printf 'Kof installation already current: %s (%s)\n' "$version" "$sha"
+        write_install_state "$install_path" "$sha" "$version" "$tag" \
+            "$(state_value PREVIOUS_PATH || true)" "$(state_value PREVIOUS_SHA || true)" "$(state_value PREVIOUS_VERSION || true)"
+        return $?
+    fi
+    if [ -n "$current_path" ]; then
+        previous_sha=$(state_value ACTIVE_SHA || true)
+        previous_version=$("$current_path/bin/kof" version 2>/dev/null | awk '{print $2}' || true)
+    fi
+    mkdir -p "$(dirname "$KOF_BIN_LINK")"
+    local temporary_link
+    temporary_link="$(dirname "$KOF_BIN_LINK")/.kof-main-sync.$$"
+    [ ! -e "$temporary_link" ] && [ ! -L "$temporary_link" ] || return 20
+    ln -s "$install_path/bin/kof" "$temporary_link" || return 20
+    mv -Tf -- "$temporary_link" "$KOF_BIN_LINK" || return 20
+    write_install_state "$install_path" "$sha" "$version" "$tag" "$current_path" "$previous_sha" "$previous_version" || return 20
+    log "phase=install result=activated version=$version sha=$sha path=$install_path"
+    printf 'Activated Kof %s from %s\n' "$version" "$sha"
+}
+
+install_release() {
+    local dry_run=$1 target_sha=$2
+    if [ "$INSTALL_KOF" != true ]; then
+        log "phase=install result=disabled"
+        printf 'Kof release installation disabled.\n'
+        return 0
+    fi
+    local version tag dist_name tag_sha
+    version=$(git -C "$REPO_DIR" show "$target_sha:VERSION" 2>/dev/null | tr -d '\r\n') || return 20
+    case "$version" in
+        ''|*[!0-9A-Za-z._-]*) die "invalid VERSION at $target_sha" || return ;;
+    esac
+    tag="kof-$version-linux-x86_64"
+    dist_name="kof-$version-linux-x86_64"
+    tag_sha=$(resolved_remote_tag_sha "$tag") || {
+        log "phase=install result=pending reason=missing-tag version=$version sha=$target_sha"
+        printf 'Release pending: %s\n' "$tag"
+        return 10
+    }
+    if [ "$tag_sha" != "$target_sha" ]; then
+        log "phase=install result=pending reason=tag-sha-mismatch version=$version expected=$target_sha actual=${tag_sha:-missing}"
+        printf 'Release does not yet match main: %s\n' "$tag"
+        return 10
+    fi
+    local asset_names
+    asset_names=$("$GH_BIN" release view "$tag" --repo "$UPSTREAM_REPO" --json assets --jq '.assets[].name' 2>/dev/null) || {
+        log "phase=install result=pending reason=release-unavailable tag=$tag"
+        return 10
+    }
+    printf '%s\n' "$asset_names" | grep -Fxq "$dist_name.tar.gz" || return 10
+    printf '%s\n' "$asset_names" | grep -Fxq SHA256SUMS || return 10
+    if [ "$dry_run" = true ]; then
+        log "phase=install result=dry-run version=$version sha=$target_sha tag=$tag"
+        printf 'Would install official Kof release: %s (%s)\n' "$version" "$target_sha"
+        return 0
+    fi
+    local install_path="$KOF_DATA_DIR/$dist_name"
+    if [ -x "$install_path/bin/kof" ] && [ -x "$install_path/jdk/bin/java" ]; then
+        "$install_path/bin/kof" version >/dev/null 2>&1 || return 20
+        "$install_path/bin/kof" info >/dev/null 2>&1 || return 20
+        activate_installation "$install_path" "$target_sha" "$version" "$tag"
+        return $?
+    fi
+    if [ -e "$install_path" ]; then
+        die "existing installation is incomplete: $install_path" || return
+    fi
+    mkdir -p "$KOF_DATA_DIR"
+    local staging
+    staging=$(mktemp -d "$KOF_DATA_DIR/.staging.XXXXXX") || return 20
+    local prepare_result=0
+    prepare_release "$staging" "$tag" "$dist_name" "$version" || prepare_result=$?
+    if [ "$prepare_result" -ne 0 ]; then
+        log "phase=install result=error reason=package-validation-$prepare_result tag=$tag"
+        cleanup_staging "$staging" || true
+        return 20
+    fi
+    local extracted="$staging/$dist_name"
+    mv -- "$extracted" "$install_path" || { cleanup_staging "$staging" || true; return 20; }
+    cleanup_staging "$staging" || return 20
+    activate_installation "$install_path" "$target_sha" "$version" "$tag"
+}
+
+run_sync() {
+    local dry_run=false
+    if [ "${1:-}" = "--dry-run" ]; then dry_run=true; shift; fi
+    [ "$#" -eq 0 ] || { usage >&2; return 20; }
+    load_config || return $?
+    require_commands || return $?
+    ensure_state_dir
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "result=busy"
+        printf '%s: another run holds the lock\n' "$PROGRAM" >&2
+        return 11
+    fi
+    local started=$SECONDS checkout_result=0 origin_result=0 install_result=0
+    SYNCED_SHA=""
+    log "event=start mode=$([ "$dry_run" = true ] && printf dry-run || printf run)"
+    sync_checkout "$dry_run" || checkout_result=$?
+    if [ "$checkout_result" -eq 0 ] && [ -n "$SYNCED_SHA" ]; then
+        sync_origin "$dry_run" "$SYNCED_SHA" || origin_result=$?
+        install_release "$dry_run" "$SYNCED_SHA" || install_result=$?
+    else
+        origin_result=10
+        install_result=10
+    fi
+    log "event=end checkout=$checkout_result origin=$origin_result install=$install_result duration=$((SECONDS - started))"
+    if [ "$checkout_result" -ge 20 ] || [ "$origin_result" -ge 20 ] || [ "$install_result" -ge 20 ]; then return 20; fi
+    if [ "$checkout_result" -ne 0 ] || [ "$origin_result" -ne 0 ] || [ "$install_result" -ne 0 ]; then return 10; fi
+    return 0
+}
+
+cron_snapshot() {
+    local error_file status=0
+    error_file=$(mktemp "$STATE_DIR/crontab-error.XXXXXX") || return 20
+    "$CRONTAB_BIN" -l 2>"$error_file" || status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -f -- "$error_file"
+        return 0
+    fi
+    if grep -qi 'no crontab' "$error_file"; then
+        rm -f -- "$error_file"
+        return 0
+    fi
+    cat "$error_file" >&2
+    rm -f -- "$error_file"
+    return 20
+}
+
+install_cron() {
+    load_config || return $?
+    require_commands || return $?
+    validate_checkout || return $?
+    if [ -n "$ORIGIN_REPO" ]; then
+        "$GH_BIN" auth status --hostname github.com >/dev/null 2>&1 || die "GitHub CLI is not authenticated" || return
+        "$GH_BIN" auth setup-git --hostname github.com >/dev/null || return 20
+    fi
+    local current filtered new_crontab cron_line
+    ensure_state_dir
+    current=$(mktemp "$STATE_DIR/crontab-current.XXXXXX") || return 20
+    filtered=$(mktemp "$STATE_DIR/crontab-filtered.XXXXXX") || return 20
+    new_crontab=$(mktemp "$STATE_DIR/crontab-new.XXXXXX") || return 20
+    cron_snapshot > "$current" || return $?
+    sed "/# kof-main-sync[[:space:]]*$/d" "$current" > "$filtered"
+    cron_line="*/$INTERVAL_MINUTES * * * * $HOME/.local/bin/kof-main-sync run >/dev/null 2>&1 $MARKER"
+    cp "$filtered" "$new_crontab"
+    printf '%s\n' "$cron_line" >> "$new_crontab"
+    "$CRONTAB_BIN" "$new_crontab" || return 20
+    rm -f -- "$current" "$filtered" "$new_crontab"
+    log "event=cron-installed interval=$INTERVAL_MINUTES"
+    printf 'Installed cron entry: %s\n' "$cron_line"
+}
+
+uninstall_cron() {
+    load_config || return $?
+    ensure_state_dir
+    local current filtered
+    current=$(mktemp "$STATE_DIR/crontab-current.XXXXXX") || return 20
+    filtered=$(mktemp "$STATE_DIR/crontab-filtered.XXXXXX") || return 20
+    cron_snapshot > "$current" || return $?
+    sed "/# kof-main-sync[[:space:]]*$/d" "$current" > "$filtered"
+    "$CRONTAB_BIN" "$filtered" || return 20
+    rm -f -- "$current" "$filtered"
+    log "event=cron-uninstalled"
+    printf 'Removed managed cron entry.\n'
+}
+
+show_status() {
+    load_config || return $?
+    ensure_state_dir
+    printf 'Configuration: %s\n' "$CONFIG_FILE"
+    printf 'Checkout: %s\n' "$REPO_DIR"
+    if [ -d "$REPO_DIR/.git" ]; then
+        printf 'Branch: %s\n' "$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || printf detached)"
+        printf 'Checkout SHA: %s\n' "$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || printf unavailable)"
+        if [ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]; then printf 'Working tree: dirty\n'; else printf 'Working tree: clean\n'; fi
+    else
+        printf 'Checkout status: missing\n'
+    fi
+    local cron_count
+    cron_count=$(cron_snapshot | grep -c '# kof-main-sync[[:space:]]*$' || true)
+    printf 'Managed cron entries: %s\n' "$cron_count"
+    printf 'Origin synchronization: %s\n' "${ORIGIN_REPO:-disabled}"
+    if [ -L "$KOF_BIN_LINK" ]; then
+        printf 'Active Kof: %s\n' "$(readlink -f "$KOF_BIN_LINK")"
+        "$KOF_BIN_LINK" version 2>/dev/null || true
+    else
+        printf 'Active Kof: unavailable\n'
+    fi
+    if [ -f "$INSTALL_STATE" ]; then
+        printf 'Installed release SHA: %s\n' "$(state_value ACTIVE_SHA || printf unknown)"
+        printf 'Previous installation: %s\n' "$(state_value PREVIOUS_PATH || printf unavailable)"
+        printf 'Installation updated: %s\n' "$(state_value UPDATED_AT || printf unknown)"
+    fi
+    if [ -s "$LOG_FILE" ]; then
+        printf 'Last event: %s\n' "$(tail -n 1 "$LOG_FILE")"
+    else
+        printf 'Last event: none\n'
+    fi
+}
+
+rollback_installation() {
+    load_config || return $?
+    local previous_path previous_sha previous_version active_path active_sha active_version active_tag
+    previous_path=$(state_value PREVIOUS_PATH || true)
+    previous_sha=$(state_value PREVIOUS_SHA || true)
+    previous_version=$(state_value PREVIOUS_VERSION || true)
+    active_path=$(state_value ACTIVE_PATH || true)
+    active_sha=$(state_value ACTIVE_SHA || true)
+    active_version=$(state_value ACTIVE_VERSION || true)
+    active_tag=$(state_value ACTIVE_TAG || true)
+    [ -n "$previous_path" ] && [ -x "$previous_path/bin/kof" ] || die "no valid previous installation is recorded" || return
+    "$previous_path/bin/kof" version >/dev/null 2>&1 || die "previous installation failed version check" || return
+    "$previous_path/bin/kof" info >/dev/null 2>&1 || die "previous installation failed info check" || return
+    local temporary_link
+    mkdir -p "$(dirname "$KOF_BIN_LINK")"
+    temporary_link="$(dirname "$KOF_BIN_LINK")/.kof-main-sync.rollback.$$"
+    ln -s "$previous_path/bin/kof" "$temporary_link" || return 20
+    mv -Tf -- "$temporary_link" "$KOF_BIN_LINK" || return 20
+    write_install_state "$previous_path" "$previous_sha" "$previous_version" "rollback" "$active_path" "$active_sha" "$active_version" || return 20
+    log "phase=install result=rollback from=$active_path to=$previous_path former_tag=$active_tag"
+    printf 'Rolled back Kof to %s\n' "$previous_path"
+}
+
+show_logs() {
+    local follow=false
+    if [ "${1:-}" = "--follow" ]; then follow=true; shift; fi
+    [ "$#" -eq 0 ] || { usage >&2; return 20; }
+    ensure_state_dir
+    if [ ! -s "$LOG_FILE" ]; then
+        printf 'No executions recorded.\n'
+        return 0
+    fi
+    if [ "$follow" = true ]; then tail -n 100 -f "$LOG_FILE"; else tail -n 100 "$LOG_FILE"; fi
+}
+
+main() {
+    case "${1:---help}" in
+        --help|-h) usage ;;
+        install) shift; [ "$#" -eq 0 ] || return 20; install_cron ;;
+        uninstall) shift; [ "$#" -eq 0 ] || return 20; uninstall_cron ;;
+        status) shift; [ "$#" -eq 0 ] || return 20; show_status ;;
+        run) shift; run_sync "$@" ;;
+        rollback) shift; [ "$#" -eq 0 ] || return 20; rollback_installation ;;
+        logs) shift; show_logs "$@" ;;
+        *) usage >&2; return 20 ;;
+    esac
+}
+
+main "$@"

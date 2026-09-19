@@ -1,0 +1,9 @@
+# Paths must be absolute. Values are parsed as data and are never sourced.
+REPO_DIR=/home/example/projects/kof
+UPSTREAM_REPO=KofLang/Kof4j
+ORIGIN_REPO=example/Kof4j
+BRANCH=main
+INSTALL_KOF=true
+INTERVAL_MINUTES=5
+KOF_DATA_DIR=/home/example/.local/share/kof
+KOF_BIN_LINK=/home/example/.local/bin/kof

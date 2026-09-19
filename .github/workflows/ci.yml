@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Parse shell entrypoints
+        run: bash -n install.sh uninstall.sh bin/kof-main-sync tests/run.sh
+      - name: ShellCheck
+        run: shellcheck install.sh uninstall.sh bin/kof-main-sync tests/run.sh
+      - name: Behavioral tests
+        run: tests/run.sh
