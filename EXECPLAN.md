@@ -21,7 +21,7 @@ The source repository lives at `/home/renanfranca/projects/kof-main-sync`; the d
 - [x] Milestone 1 complete: installer, XDG configuration, command, license, and safe cron management implemented.
 - [x] Milestone 2 complete: isolated behavioral suite passes all synchronization, release activation, rollback, lock, and safety-stop scenarios.
 - [x] Milestone 3 complete: bilingual documentation, CI, shell parsing, and ShellCheck validation are green.
-- [ ] Milestone 4 complete.
+- [x] Milestone 4 complete: public repository created, source published, tool installed, cron active, fork converged, and Kof 0.4.7-beta activated with 0.4.2-beta retained for rollback.
 
 ## Validation
 
@@ -32,6 +32,16 @@ The source repository lives at `/home/renanfranca/projects/kof-main-sync`; the d
 - Installed `kof-main-sync run --dry-run`, `status`, and `logs` succeed in the real environment.
 - The real managed run converges the clean Kof checkout and fork, installs the exact official release when available, and leaves `kof version` and `kof info` healthy.
 - GitHub Actions completes successfully on the public `main` branch.
+
+Observed final evidence:
+
+- `bash -n install.sh uninstall.sh bin/kof-main-sync tests/run.sh`: exit 0.
+- ShellCheck through the official container: exit 0.
+- `tests/run.sh`: 9 scenarios passed.
+- `./install.sh --dry-run`: exit 0 without user-state changes.
+- Installed `kof-main-sync run`: exit 0; checkout, upstream, and origin converged to `af743ef4ece04a247386ffb790f4c4a85bcf2b9e`.
+- Installed `kof version` reports `0.4.7-beta`; `kof info` reports the embedded JDK; previous `0.4.2-beta` installation remains recorded.
+- Public GitHub Actions run for the implementation and CI correction completed successfully.
 
 ## Decisions
 
