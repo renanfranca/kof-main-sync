@@ -27,6 +27,8 @@ UPSTREAM_REPO="$DEFAULT_UPSTREAM_REPO"
 ORIGIN_REPO=""
 BRANCH="$DEFAULT_BRANCH"
 INSTALL_KOF="true"
+SKIP_KOF_VERSIONS=""
+SKIPPED_VERSIONS=()
 INTERVAL_MINUTES="$DEFAULT_INTERVAL"
 KOF_DATA_DIR="$DATA_HOME/kof"
 KOF_BIN_LINK="$HOME/.local/bin/kof"
@@ -93,6 +95,47 @@ parse_bool() {
     esac
 }
 
+valid_version() {
+    [[ "$1" =~ ^[0-9][0-9A-Za-z._-]*$ ]]
+}
+
+parse_skipped_versions() {
+    local remaining=$1 entry
+    SKIPPED_VERSIONS=()
+    SKIP_KOF_VERSIONS=""
+    # Trim surrounding whitespace, without evaluating any configuration text.
+    remaining=${remaining#"${remaining%%[![:space:]]*}"}
+    remaining=${remaining%"${remaining##*[![:space:]]}"}
+    [ -n "$remaining" ] || return 0
+    while :; do
+        entry=${remaining%%,*}
+        entry=${entry#"${entry%%[![:space:]]*}"}
+        entry=${entry%"${entry##*[![:space:]]}"}
+        valid_version "$entry" || { die "invalid SKIP_KOF_VERSIONS entry: $entry"; return 20; }
+        SKIPPED_VERSIONS+=("$entry")
+        SKIP_KOF_VERSIONS+="${SKIP_KOF_VERSIONS:+,}$entry"
+        case "$remaining" in
+            *,*) remaining=${remaining#*,} ;;
+            *) break ;;
+        esac
+    done
+}
+
+version_is_skipped() {
+    local version
+    for version in "${SKIPPED_VERSIONS[@]}"; do
+        [ "$1" != "$version" ] || return 0
+    done
+    return 1
+}
+
+skip_release() {
+    local version=$1
+    log "phase=install result=skipped reason=configured-version version=$version"
+    printf 'Kof release skipped by SKIP_KOF_VERSIONS: %s\n' "$version"
+    return 10
+}
+
 load_config() {
     [ -f "$CONFIG_FILE" ] || {
         printf '%s: configuration not found: %s\n' "$PROGRAM" "$CONFIG_FILE" >&2
@@ -114,6 +157,7 @@ load_config() {
             ORIGIN_REPO) ORIGIN_REPO=$value ;;
             BRANCH) BRANCH=$value ;;
             INSTALL_KOF) INSTALL_KOF=$(parse_bool "$value") || return 20 ;;
+            SKIP_KOF_VERSIONS) parse_skipped_versions "$value" || return $? ;;
             INTERVAL_MINUTES) INTERVAL_MINUTES=$value ;;
             KOF_DATA_DIR) KOF_DATA_DIR=$value ;;
             KOF_BIN_LINK) KOF_BIN_LINK=$value ;;
@@ -124,6 +168,17 @@ load_config() {
         ''|*[!0-9]*) return 20 ;;
     esac
     [ "$INTERVAL_MINUTES" -ge 1 ] && [ "$INTERVAL_MINUTES" -le 59 ] || return 20
+}
+
+acquire_lock() {
+    command -v flock >/dev/null 2>&1 || { die "missing dependency: flock"; return 20; }
+    ensure_state_dir || return 20
+    exec 9>"$LOCK_FILE" || return 20
+    if ! flock -n 9; then
+        log "result=busy"
+        printf '%s: another run holds the lock\n' "$PROGRAM" >&2
+        return 11
+    fi
 }
 
 require_commands() {
@@ -206,7 +261,7 @@ sync_checkout() {
     local dry_run=$1
     validate_checkout || return $?
     git -C "$REPO_DIR" fetch --no-tags upstream \
-        "refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        "+refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH" >> "$LOG_FILE" 2>&1 || {
         log "phase=checkout result=error reason=fetch-upstream"
         return 20
     }
@@ -251,7 +306,7 @@ sync_origin() {
         return 0
     fi
     git -C "$REPO_DIR" fetch --no-tags origin \
-        "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" >> "$LOG_FILE" 2>&1 || {
+        "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" >> "$LOG_FILE" 2>&1 || {
         log "phase=origin result=error reason=fetch-origin"
         return 20
     }
@@ -364,6 +419,7 @@ state_value() {
 
 activate_installation() {
     local install_path=$1 sha=$2 version=$3 tag=$4
+    if version_is_skipped "$version"; then skip_release "$version"; return $?; fi
     local current_path="" previous_sha="" previous_version=""
     if [ -L "$KOF_BIN_LINK" ]; then
         current_path=$(dirname "$(dirname "$(readlink -f "$KOF_BIN_LINK")")")
@@ -392,6 +448,61 @@ activate_installation() {
     printf 'Activated Kof %s from %s\n' "$version" "$sha"
 }
 
+installation_version() {
+    local output version
+    output=$("$1" version 2>/dev/null) || return 1
+    version=${output#kof }
+    [ "$output" = "kof $version" ] && valid_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+restore_previous_installation() {
+    local phase=$1 dry_run=$2 previous_path previous_sha previous_version actual_version info
+    previous_path=$(state_value PREVIOUS_PATH || true)
+    previous_sha=$(state_value PREVIOUS_SHA || true)
+    previous_version=$(state_value PREVIOUS_VERSION || true)
+    if [ -z "$previous_path" ] || [ ! -x "$previous_path/bin/kof" ]; then
+        die "$phase: no valid previous installation is recorded"; return 20;
+    fi
+    valid_version "$previous_version" || { die "$phase: invalid recorded previous version"; return 20; }
+    if version_is_skipped "$previous_version"; then
+        die "$phase: previous Kof $previous_version is blocked by SKIP_KOF_VERSIONS"; return 20
+    fi
+    actual_version=$(installation_version "$previous_path/bin/kof") || {
+        die "$phase: previous installation failed version check"; return 20;
+    }
+    [ "$actual_version" = "$previous_version" ] || {
+        die "$phase: previous version mismatch: recorded=$previous_version actual=$actual_version"; return 20;
+    }
+    info=$("$previous_path/bin/kof" info 2>/dev/null) || {
+        die "$phase: previous installation failed info check"; return 20;
+    }
+    [[ "$info" == *'(embedded)'* ]] || {
+        die "$phase: previous installation has no embedded JDK"; return 20;
+    }
+    if [ "$dry_run" = true ]; then
+        log "phase=$phase result=dry-run version=$previous_version path=$previous_path"
+        printf 'Would restore previous Kof %s: %s\n' "$previous_version" "$previous_path"
+        return 0
+    fi
+    activate_installation "$previous_path" "$previous_sha" "$previous_version" "$phase" || return $?
+    log "phase=$phase result=restored version=$previous_version path=$previous_path"
+    printf 'Restored previous Kof %s (%s).\n' "$previous_version" "$phase"
+}
+
+recover_ignored_installation() {
+    local dry_run=$1 active_version
+    [ "$INSTALL_KOF" = true ] && [ -n "$SKIP_KOF_VERSIONS" ] || return 0
+    [ -L "$KOF_BIN_LINK" ] || return 0
+    active_version=$(installation_version "$KOF_BIN_LINK") || {
+        die "recovery: cannot determine active Kof version"; return 20;
+    }
+    version_is_skipped "$active_version" || return 0
+    log "phase=recovery result=blocked version=$active_version"
+    printf 'Active Kof %s is blocked by SKIP_KOF_VERSIONS.\n' "$active_version"
+    restore_previous_installation recovery "$dry_run"
+}
+
 install_release() {
     local dry_run=$1 target_sha=$2
     if [ "$INSTALL_KOF" != true ]; then
@@ -404,6 +515,7 @@ install_release() {
     case "$version" in
         ''|*[!0-9A-Za-z._-]*) die "invalid VERSION at $target_sha" || return ;;
     esac
+    if version_is_skipped "$version"; then skip_release "$version"; return $?; fi
     tag="kof-$version-linux-x86_64"
     dist_name="kof-$version-linux-x86_64"
     tag_sha=$(resolved_remote_tag_sha "$tag") || {
@@ -458,18 +570,13 @@ run_sync() {
     local dry_run=false
     if [ "${1:-}" = "--dry-run" ]; then dry_run=true; shift; fi
     [ "$#" -eq 0 ] || { usage >&2; return 20; }
+    acquire_lock || return $?
     load_config || return $?
-    require_commands || return $?
-    ensure_state_dir
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        log "result=busy"
-        printf '%s: another run holds the lock\n' "$PROGRAM" >&2
-        return 11
-    fi
     local started=$SECONDS checkout_result=0 origin_result=0 install_result=0
     SYNCED_SHA=""
     log "event=start mode=$([ "$dry_run" = true ] && printf dry-run || printf run)"
+    recover_ignored_installation "$dry_run" || return $?
+    require_commands || return $?
     sync_checkout "$dry_run" || checkout_result=$?
     if [ "$checkout_result" -eq 0 ] && [ -n "$SYNCED_SHA" ]; then
         sync_origin "$dry_run" "$SYNCED_SHA" || origin_result=$?
@@ -555,9 +662,15 @@ show_status() {
     cron_count=$(cron_snapshot | grep -c '# kof-main-sync[[:space:]]*$' || true)
     printf 'Managed cron entries: %s\n' "$cron_count"
     printf 'Origin synchronization: %s\n' "${ORIGIN_REPO:-disabled}"
+    printf 'Skipped Kof versions: %s\n' "${SKIP_KOF_VERSIONS:-none}"
     if [ -L "$KOF_BIN_LINK" ]; then
         printf 'Active Kof: %s\n' "$(readlink -f "$KOF_BIN_LINK")"
         "$KOF_BIN_LINK" version 2>/dev/null || true
+        local active_version
+        active_version=$(installation_version "$KOF_BIN_LINK" || true)
+        if version_is_skipped "$active_version"; then
+            printf 'Warning: active Kof %s is blocked by SKIP_KOF_VERSIONS.\n' "$active_version"
+        fi
     else
         printf 'Active Kof: unavailable\n'
     fi
@@ -574,26 +687,9 @@ show_status() {
 }
 
 rollback_installation() {
+    acquire_lock || return $?
     load_config || return $?
-    local previous_path previous_sha previous_version active_path active_sha active_version active_tag
-    previous_path=$(state_value PREVIOUS_PATH || true)
-    previous_sha=$(state_value PREVIOUS_SHA || true)
-    previous_version=$(state_value PREVIOUS_VERSION || true)
-    active_path=$(state_value ACTIVE_PATH || true)
-    active_sha=$(state_value ACTIVE_SHA || true)
-    active_version=$(state_value ACTIVE_VERSION || true)
-    active_tag=$(state_value ACTIVE_TAG || true)
-    [ -n "$previous_path" ] && [ -x "$previous_path/bin/kof" ] || die "no valid previous installation is recorded" || return
-    "$previous_path/bin/kof" version >/dev/null 2>&1 || die "previous installation failed version check" || return
-    "$previous_path/bin/kof" info >/dev/null 2>&1 || die "previous installation failed info check" || return
-    local temporary_link
-    mkdir -p "$(dirname "$KOF_BIN_LINK")"
-    temporary_link="$(dirname "$KOF_BIN_LINK")/.kof-main-sync.rollback.$$"
-    ln -s "$previous_path/bin/kof" "$temporary_link" || return 20
-    mv -Tf -- "$temporary_link" "$KOF_BIN_LINK" || return 20
-    write_install_state "$previous_path" "$previous_sha" "$previous_version" "rollback" "$active_path" "$active_sha" "$active_version" || return 20
-    log "phase=install result=rollback from=$active_path to=$previous_path former_tag=$active_tag"
-    printf 'Rolled back Kof to %s\n' "$previous_path"
+    restore_previous_installation rollback false
 }
 
 show_logs() {

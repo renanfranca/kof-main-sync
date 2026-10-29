@@ -12,6 +12,8 @@ O `kof-main-sync` executa três fases independentes:
 2. Avança um fork pessoal existente quando sua `main` for ancestral do commit sincronizado.
 3. Instala uma release Linux oficial somente quando sua tag aponta para o mesmo commit de `main` e o checksum e a estrutura do pacote forem válidos.
 
+Com `INSTALL_KOF=true`, cada execução primeiro restaura a instalação anterior registrada se o compilador ativo estiver em `SKIP_KOF_VERSIONS`. A recuperação usa o lock compartilhado da instalação e ocorre antes de verificar a árvore de trabalho ou acessar os remotos Git. Assim, checkout sujo ou falha de rede não impedem a recuperação.
+
 Falha na release nunca reverte a documentação atualizada. Não existe fallback de compilação local: se a CI de release do Kof não publicar o artefato, o compilador atualmente instalado continua ativo.
 
 A ferramenta nunca usa hard reset, rebase, merge commit, force push ou descarte automático de commits.
@@ -92,7 +94,7 @@ Códigos de saída:
 | Código | Significado |
 |---:|---|
 | `0` | Todas as fases habilitadas funcionaram ou já estavam atualizadas |
-| `10` | Uma fase foi pulada com segurança, como checkout sujo ou release pendente |
+| `10` | Uma fase foi pulada com segurança, como checkout sujo, release pendente ou versão ignorada |
 | `11` | Outra execução possui o lock |
 | `20+` | Erro de configuração, rede, autenticação, integridade ou instalação |
 
@@ -109,6 +111,16 @@ Comando Kof:  $HOME/.local/bin/kof
 ```
 
 A configuração é interpretada como dados e nunca carregada como código shell. Consulte [`config/config.example`](config/config.example).
+
+Para ignorar uma release problemática do Kof, edite a configuração existente:
+
+```ini
+SKIP_KOF_VERSIONS=0.6.7
+```
+
+Aceita várias versões exatas separadas por vírgulas, por exemplo `SKIP_KOF_VERSIONS=0.6.7, 0.6.5`, com espaços opcionais ao redor de cada entrada. A versão deve começar por um dígito e conter apenas letras ASCII, dígitos, pontos, sublinhados ou hífens. Entradas vazias entre vírgulas, expressões shell e outros valores inválidos geram diagnóstico e código `20`, sem alterar a instalação. Chave ausente ou valor vazio mantém o comportamento existente. A reinstalação preserva a lista configurada.
+
+Ignorar `0.6.7` não ignora `0.6.70` nem uma futura `0.6.8`. Uma versão posterior permitida continua sendo instalada automaticamente quando passa nas verificações existentes de release, checksum, pacote e correspondência entre tag e commit. O bloqueio ocorre antes de consultar tags/releases, baixar arquivos ou ativar distribuições já presentes no disco; uma release ignorada retorna `10`. O `status` exibe a lista e alerta quando o compilador realmente ativo está ignorado. Bloqueios e recuperações são registrados no log.
 
 Entrada marcada do crontab:
 
@@ -134,6 +146,10 @@ A ativação substitui somente o symlink `~/.local/bin/kof`, usando rename atôm
 kof-main-sync rollback
 ```
 
+Tanto a recuperação automática quanto `rollback` conferem a versão real do compilador anterior contra `PREVIOUS_VERSION` de `installed.state`, executam `version` e `info` e exigem o JDK embutido. Uma instalação anterior bloqueada, ausente, divergente ou com falha gera diagnóstico e código `20`, preservando o symlink ativo e o estado da instalação. A ferramenta não procura nem baixa outra candidata para recuperação. A distribuição restaurada passa a ativa e a substituída fica registrada como anterior; `rollback` recusa reativá-la enquanto estiver ignorada.
+
+`run`, `run --dry-run` e `rollback` compartilham o lock e retornam `11` quando ele está ocupado. O instalador também usa esse lock ao substituir o executável e a configuração. `run --dry-run` mostra a recuperação e os bloqueios previstos sem alterar o symlink do Kof nem `installed.state`. Ele pode atualizar referências locais dos remotos e logs. `INSTALL_KOF=false` desabilita recuperação automática e instalação de releases; um `rollback` explícito continua respeitando a lista.
+
 Versões antigas nunca são apagadas automaticamente. Depois de confirmar que uma versão não será necessária para rollback, remova manualmente apenas seu diretório específico em `~/.local/share/kof/`.
 
 ## Paradas seguras e recuperação
@@ -146,6 +162,8 @@ A atualização do checkout é pulada quando:
 - a `main` local possui commits exclusivos ou diverge do upstream.
 
 O fork é pulado quando sua `main` estiver à frente ou divergente. Resolva essas condições Git manualmente; a ferramenta tentará novamente na próxima execução.
+
+O fetch aceita histórico reescrito nas referências locais dos remotos (`upstream/main` e `origin/main`). A branch de trabalho e o fork continuam avançando somente por fast-forward; divergências exigem recuperação manual. A sincronização automática nunca executa reset da branch de trabalho nem force push do fork.
 
 Uma release indisponível é normal enquanto a CI do Kof está executando. Documentação e fork podem avançar enquanto o compilador instalado permanece na última versão validada.
 

@@ -6,6 +6,7 @@ UPSTREAM_REPO="KofLang/Kof4j"
 REPO_DIR="$HOME/projects/kof"
 ORIGIN_REPO="auto"
 INSTALL_KOF="true"
+SKIP_KOF_VERSIONS=""
 INTERVAL_MINUTES="5"
 DRY_RUN="false"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,6 +134,19 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+exec 8>"$STATE_DIR/sync.lock"
+chmod 600 "$STATE_DIR/sync.lock"
+if ! flock -n 8; then
+    printf '%s: another run holds the lock\n' "$PROGRAM" >&2
+    exit 11
+fi
+# Preserve the list as data when reinstalling, including optional entry spaces.
+if [ -f "$CONFIG_FILE" ]; then
+    SKIP_KOF_VERSIONS=$(awk '/^SKIP_KOF_VERSIONS=/ { value = substr($0, index($0, "=") + 1) } END { print value }' "$CONFIG_FILE")
+fi
+
 mkdir -p "$(dirname "$REPO_DIR")"
 if [ ! -e "$REPO_DIR" ]; then
     git clone "https://github.com/$UPSTREAM_REPO.git" "$REPO_DIR"
@@ -168,7 +182,9 @@ fi
 
 mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$STATE_DIR" "$KOF_DATA_DIR"
 chmod 700 "$CONFIG_DIR" "$STATE_DIR"
-install -m 0755 "$SOURCE_DIR/bin/$PROGRAM" "$BIN_DIR/$PROGRAM"
+temporary_command=$(mktemp "$BIN_DIR/.$PROGRAM.XXXXXX")
+install -m 0755 "$SOURCE_DIR/bin/$PROGRAM" "$temporary_command"
+mv -f -- "$temporary_command" "$BIN_DIR/$PROGRAM"
 
 temporary_config=$(mktemp "$CONFIG_DIR/config.XXXXXX")
 {
@@ -177,12 +193,15 @@ temporary_config=$(mktemp "$CONFIG_DIR/config.XXXXXX")
     printf 'ORIGIN_REPO=%s\n' "$ORIGIN_REPO"
     printf 'BRANCH=main\n'
     printf 'INSTALL_KOF=%s\n' "$INSTALL_KOF"
+    printf 'SKIP_KOF_VERSIONS=%s\n' "$SKIP_KOF_VERSIONS"
     printf 'INTERVAL_MINUTES=%s\n' "$INTERVAL_MINUTES"
     printf 'KOF_DATA_DIR=%s\n' "$KOF_DATA_DIR"
     printf 'KOF_BIN_LINK=%s\n' "$KOF_BIN_LINK"
 } > "$temporary_config"
 chmod 600 "$temporary_config"
 mv -f "$temporary_config" "$CONFIG_FILE"
+flock -u 8
+exec 8>&-
 
 "$BIN_DIR/$PROGRAM" run --dry-run || result=$?
 result=${result:-0}

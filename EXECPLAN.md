@@ -1,66 +1,132 @@
-# Deliver a safe Kof main synchronizer
+# Skip problematic Kof releases and recover WSL
 
 ## Purpose and success
 
-Create and publish `renanfranca/kof-main-sync`, a reusable Debian/Ubuntu/WSL2 tool that keeps a clean local Kof `main` checkout current for documentation consumers, fast-forwards an existing personal fork when safe, and atomically activates only an official Linux Kof release whose tag matches the synchronized commit. Success means the installer, command, cron integration, rollback, bilingual documentation, and automated tests work without modifying tracked files in the Kof checkout or installing system packages.
+Implement the approved plan: parse `SKIP_KOF_VERSIONS` in the existing data-only
+configuration, prevent ignored release activation, and restore the recorded
+previous installation when the active compiler is ignored. Deliver a validated
+WSL installation with Kof 0.6.6 active and 0.6.7 blocked, plus local Kof `main`
+and the personal fork aligned to the upstream commit observed during recovery.
 
 ## Context and limits
 
-The source repository lives at `/home/renanfranca/projects/kof-main-sync`; the default managed Kof checkout is `$HOME/projects/kof`. Runtime files follow XDG defaults under `$HOME/.config`, `$HOME/.local/state`, and `$HOME/.local/share`. The tool may clone and configure a missing Kof checkout, but it must not create forks, use destructive Git operations, compile unreleased Kof commits, silently invoke `sudo`, or alter unrelated crontab entries. Initial supported systems are Debian, Ubuntu, and WSL2.
+Source: `/home/renanfranca/projects/kof-main-sync`. Managed checkout:
+`/home/renanfranca/projects/kof`. Configuration:
+`~/.config/kof-main-sync/config`. State and shared lock:
+`~/.local/state/kof-main-sync/{installed.state,sync.lock}`. Installations:
+`~/.local/share/kof/`; compiler link: `~/.local/bin/kof`.
+
+Inspection on 2026-10-29 confirmed Kof 0.6.7 active, previous Kof 0.6.6 recorded
+and healthy with embedded JDK, a clean Kof `main`, and fork sync enabled.
+Implementation uses branch `skip-kof-versions`. Do not delete distributions.
+Automatic Git updates remain fast-forward only. The user's authorization allows
+separate, one-time local reset and fork update with an explicit observed remote
+SHA lease. No Kof source changes, upstream push, or release promotion is in scope.
 
 ## Milestones
 
-1. Establish the public tool contract and installer. Add the executable, configuration example, installer, uninstaller, license, and ignore rules. Validate shell syntax and dry-run installation behavior.
-2. Implement and exercise synchronization behavior. Cover Git safety gates, optional fork detection/push, exact-SHA release validation, atomic activation, status, logs, locking, and rollback with isolated fixtures.
-3. Reconcile bilingual documentation and automation. Add English and Portuguese usage/recovery documentation plus CI for ShellCheck and tests; run the complete local validation suite.
-4. Install and publish. Create the public GitHub repository, commit and push the validated source, install it locally, run the real dry-run and synchronization, then verify cron, Kof version, status, logs, and rollback availability without performing a rollback.
+1. Implement configuration, recovery, shared locking, skip diagnostics/status,
+   and forced remote tracking fetches in `bin/kof-main-sync`. Update `install.sh`
+   to preserve the skip list and replace the executable atomically under lock.
+   Extend `tests/run.sh` around public commands and observable state.
+2. Update `config/config.example`, `README.md`, and `README.pt_BR.md`. Validate
+   shell syntax, ShellCheck, isolated tests, and assertion sensitivity to
+   incorrect behavior. Reconcile every approved acceptance scenario.
+3. Deploy the validated executable and block 0.6.7 under the cron lock. Exercise
+   dry-run and recovery, then re-query upstream/fork heads and perform the
+   authorized one-time Git realignment. Verify compiler version/info, link,
+   installation state, logs, and remote alignment.
 
 ## Progress
 
-- [x] Target path and GitHub repository name verified as available.
-- [x] Milestone 1 complete: installer, XDG configuration, command, license, and safe cron management implemented.
-- [x] Milestone 2 complete: isolated behavioral suite passes all synchronization, release activation, rollback, lock, and safety-stop scenarios.
-- [x] Milestone 3 complete: bilingual documentation, CI, shell parsing, and ShellCheck validation are green.
-- [x] Milestone 4 complete: public repository created, source published, tool installed, cron active, fork converged, and Kof 0.4.7-beta activated with 0.4.2-beta retained for rollback.
+- [x] Inspect source, tests, installer, configuration, cron, Kof sources and
+      installed distributions; create the implementation branch.
+- [x] Implement behavior through isolated public-command tests: 24 scenarios pass.
+- [x] Update both READMEs and the configuration example; ShellCheck passes using
+      the existing official `koalaman/shellcheck:stable` Docker image.
+- [x] Complete syntax/suite final pass and assertion sensitivity audit: all 24
+      scenarios pass and all nine deliberately incorrect variants are rejected.
+- [x] Deploy atomically under the cron lock, recover Kof 0.6.6, align local/fork
+      main, and capture operational proof.
 
 ## Validation
 
-- `bash -n install.sh uninstall.sh bin/kof-main-sync tests/run.sh` exits 0.
-- `tests/run.sh` exits 0 using temporary HOME, Git repositories, release fixtures, and command shims.
-- ShellCheck exits 0 locally through the official `koalaman/shellcheck:stable` container; CI runs the packaged Ubuntu ShellCheck command.
-- `./install.sh --dry-run` reports intended paths and dependencies without changing user state.
-- Installed `kof-main-sync run --dry-run`, `status`, and `logs` succeed in the real environment.
-- The real managed run converges the clean Kof checkout and fork, installs the exact official release when available, and leaves `kof version` and `kof info` healthy.
-- GitHub Actions completes successfully on the public `main` branch.
+Required commands: `bash -n install.sh uninstall.sh bin/kof-main-sync tests/run.sh`,
+`shellcheck install.sh uninstall.sh bin/kof-main-sync tests/run.sh`, and
+`tests/run.sh`. Tests use temporary HOME, local bare remotes, fake releases,
+and command shims, without touching the real installation or GitHub fork.
 
-Observed final evidence:
+Exercise absent/empty/multiple/invalid skip values, exact matching, ignored
+release before API/download or disk activation, successful recovery and repeated
+runs, recovery before dirty/network Git failure, unavailable/ignored/mismatched
+or failing predecessor, rollback refusal, dry-run immutability, shared locking,
+later allowed release, reinstall preservation, and rewritten remote history.
+Validate checksums and tag/commit gates remain effective for allowed releases.
 
-- `bash -n install.sh uninstall.sh bin/kof-main-sync tests/run.sh`: exit 0.
-- ShellCheck through the official container: exit 0.
-- `tests/run.sh`: 9 scenarios passed.
-- `./install.sh --dry-run`: exit 0 without user-state changes.
-- Installed `kof-main-sync run`: exit 0; checkout, upstream, and origin converged to `af743ef4ece04a247386ffb790f4c4a85bcf2b9e`.
-- Installed `kof version` reports `0.4.7-beta`; `kof info` reports the embedded JDK; previous `0.4.2-beta` installation remains recorded.
-- Public GitHub Actions run for the implementation and CI correction completed successfully.
+Milestone 1 evidence: `tests/run.sh` exits 0 (24 scenarios), including actual
+installer runs in the isolated fixture. ShellCheck exits 0 through the official
+container. The skip list is parsed without shell evaluation, recovery precedes
+Git validation/fetch, and both restoration commands use the same predecessor
+validation path and lock. Fetches now force only remote tracking refs.
 
-## Decisions
+Milestone 2 evidence: syntax parsing and ShellCheck exit 0; 24 public-command
+scenarios pass. An independent temporary-copy assertion audit rejects release
+queries before skipping, absent recovery, accepted predecessor version mismatch,
+ignored `info` failure, modifying dry-run, rollback bypassing the list or lock,
+discarding a divergent local branch, and reinstall clearing the list. The audit
+script/log are in `/tmp/kof-main-sync-assertion-audit.{py,log}`. Structural review
+found no additional refactor necessary within the implemented contract.
 
-- Use an existing authenticated user's fork only after verifying its parent is `KofLang/Kof4j`; never create a fork implicitly. This preserves a reusable default without surprising external mutations.
-- Keep documentation/fork synchronization independent from binary activation. A missing or failed release must not roll back current documentation.
-- Require an exact release-tag-to-commit match and official checksums, with no local-build fallback. This makes GitHub's release gate the trust boundary for executable installation.
-- Retain old validated Kof installations. Automatic deletion would make rollback destructive and could consume user-owned installations.
+Final validation on 2026-10-29: `bash -n` exits 0; ShellCheck in the official
+Docker image exits 0; `tests/run.sh` exits 0 with 24 scenarios after the final
+code changes. `git diff --check` passes. All requested behavioral acceptance
+criteria have evidence. Later allowed release installation, malformed
+predecessors, network failure, and competing lock holders were exercised in the
+isolated suite; no real future release was installed as part of verification.
 
-## Risks
+Operational evidence at 16:04 America/Bahia:
 
-- The working checkout may be dirty or on another branch; the tool must skip its update instead of disrupting user work.
-- Cron has a minimal environment; installed paths and configuration discovery must not depend on an interactive shell.
-- Release archives are external input; extraction must reject unsafe member paths before activation.
-- Initial origin is hundreds of commits behind; only normal fast-forward push is allowed, and any concurrent remote update must fail safely.
+- The installed executable matches `bin/kof-main-sync` byte for byte, and the
+  existing config contains `SKIP_KOF_VERSIONS=0.6.7` with fork sync enabled.
+- The real dry-run reported recovery of 0.6.6 while preserving the symlink and
+  `installed.state`. The real recovery restored 0.6.6 before the Git divergence
+  stop (exit 10).
+- `kof version` prints `kof 0.6.6`; `kof info` succeeds and reports Eclipse
+  Adoptium 25.0.4.1 `(embedded)`. The symlink points to
+  `~/.local/share/kof/kof-0.6.6-linux-x86_64/bin/kof`. State records active SHA
+  `7c237861a9035d84b1f7ec4cfddd89daef4c6ddd` and previous version 0.6.7.
+- The one-time operation re-observed upstream as
+  `b7112fd1db25531da02970ac528ddb00bffe2ccd` and origin as
+  `df27d89fc94b56344984ac42579bc8bb40809150`. Only the fork's `main` was pushed,
+  with `--force-with-lease=refs/heads/main:df27d89fc94b56344984ac42579bc8bb40809150`.
+  Afterwards local `main`, both tracking refs, and both live remote `main` heads
+  were independently verified at `b7112fd1db25531da02970ac528ddb00bffe2ccd`.
+- Two subsequent normal runs and a dry-run return 10 exclusively because the
+  0.6.7 release is ignored; compiler link and state remain unchanged. Real
+  `rollback` refuses 0.6.7 with exit 20 and also preserves both.
+- The Kof working tree is clean. Cron remains active and its complete crontab
+  matches the saved original. Distribution directories remain intact.
 
-## Documentation
+Backups and command output are retained in
+`/home/renanfranca/.local/state/kof-main-sync/skip-versions-recovery.fSnfjX/`;
+`sync.log` records deployment, recovery, the explicit one-time Git operation,
+and later blocks. The former local main is also retained at
+`refs/kof-main-sync/before-main-realignment-20261029T160352` in the Kof checkout.
+Source changes and validation evidence are grouped on `skip-kof-versions`.
 
-`README.md` and `README.pt_BR.md` will explain installation, the three independent synchronization phases, configuration, WSL2 scheduling limits, release gating, status/log interpretation, rollback, manual cleanup, and uninstall semantics.
+PR #1 follow-up: the first CI run reported SC2015 for the predecessor path
+guard and two no-network assertions. Replaced the ambiguous `A && B || C`
+forms with explicit `if` conditions without changing behavior. Shell syntax,
+ShellCheck in both official `stable` and `v0.9.0` images, `git diff --check`,
+and all 24 isolated scenarios pass after this correction.
 
 ## Rollout and recovery
 
-The installer first validates and performs a dry run, then writes only XDG-owned files and one marked crontab entry. Binary activation uses a temporary symlink followed by atomic rename. The prior verified target is recorded and can be restored with `rollback`. Uninstall removes only the managed cron entry and installed command/config, leaving Kof checkouts, logs, and distributions intact.
+Use the same `sync.lock` as cron for executable/config deployment and one-time
+Git realignment. Preserve backups of installed command/config for diagnosis.
+Deploy with temporary files and rename. First run with `--dry-run` and compare
+compiler link and state; then run normally and verify recovery even if Git is
+divergent. Re-query upstream and origin immediately before realignment, require
+a clean Kof checkout, and push only `main` using
+`--force-with-lease=refs/heads/main:<observed-origin-sha>`. Abort on lease rejection;
+subsequent automatic runs use normal push. Keep old distributions available.
