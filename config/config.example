@@ -4,6 +4,9 @@ UPSTREAM_REPO=KofLang/Kof4j
 ORIGIN_REPO=example/Kof4j
 BRANCH=main
 INSTALL_KOF=true
+# Exact versions separated by commas, with optional surrounding spaces.
+# Empty or absent means no versions are skipped. Example: 0.6.7, 0.6.5
+SKIP_KOF_VERSIONS=
 INTERVAL_MINUTES=5
 KOF_DATA_DIR=/home/example/.local/share/kof
 KOF_BIN_LINK=/home/example/.local/bin/kof
