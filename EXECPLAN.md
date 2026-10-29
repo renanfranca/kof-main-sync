@@ -114,6 +114,12 @@ and later blocks. The former local main is also retained at
 `refs/kof-main-sync/before-main-realignment-20261029T160352` in the Kof checkout.
 Source changes and validation evidence are grouped on `skip-kof-versions`.
 
+PR #1 follow-up: the first CI run reported SC2015 for the predecessor path
+guard and two no-network assertions. Replaced the ambiguous `A && B || C`
+forms with explicit `if` conditions without changing behavior. Shell syntax,
+ShellCheck in both official `stable` and `v0.9.0` images, `git diff --check`,
+and all 24 isolated scenarios pass after this correction.
+
 ## Rollout and recovery
 
 Use the same `sync.lock` as cron for executable/config deployment and one-time

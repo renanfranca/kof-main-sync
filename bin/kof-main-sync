@@ -461,9 +461,9 @@ restore_previous_installation() {
     previous_path=$(state_value PREVIOUS_PATH || true)
     previous_sha=$(state_value PREVIOUS_SHA || true)
     previous_version=$(state_value PREVIOUS_VERSION || true)
-    [ -n "$previous_path" ] && [ -x "$previous_path/bin/kof" ] || {
+    if [ -z "$previous_path" ] || [ ! -x "$previous_path/bin/kof" ]; then
         die "$phase: no valid previous installation is recorded"; return 20;
-    }
+    fi
     valid_version "$previous_version" || { die "$phase: invalid recorded previous version"; return 20; }
     if version_is_skipped "$previous_version"; then
         die "$phase: previous Kof $previous_version is blocked by SKIP_KOF_VERSIONS"; return 20

@@ -254,7 +254,9 @@ for invalid in ',1.1.0' '1.1.0,' '1.0.0,,1.1.0' '1.1.0 1.0.0' 'v1.1.0' '../1.1.0
     assert_exit 20 "$tool" run
     assert_contains "$TMP_ROOT/command.out" 'invalid SKIP_KOF_VERSIONS entry'
     assert_install_unchanged
-    [ ! -s "$MOCK_GH_CALLS" ] && [ ! -s "$MOCK_GIT_CALLS" ] || fail "invalid config reached Git or release API"
+    if [ -s "$MOCK_GH_CALLS" ] || [ -s "$MOCK_GIT_CALLS" ]; then
+        fail "invalid config reached Git or release API"
+    fi
 done
 [ ! -e "$ROOT/PWNED" ] || fail "configuration executed shell code"
 pass "invalid lists diagnose exit 20 before any installation or Git changes"
@@ -325,7 +327,9 @@ for failure in blocked missing unrecorded mismatch version info no-embedded; do
         assert_eq "$(readlink "$link")" "$new_install/bin/kof"
         cmp -s "$TMP_ROOT/failed.state" "$state" || fail "$failure recovery changed state"
     done
-    [ ! -s "$MOCK_GH_CALLS" ] && [ ! -s "$MOCK_GIT_CALLS" ] || fail "failed recovery continued into Git or release phases"
+    if [ -s "$MOCK_GH_CALLS" ] || [ -s "$MOCK_GIT_CALLS" ]; then
+        fail "failed recovery continued into Git or release phases"
+    fi
 done
 pass "invalid predecessors preserve active link/state and fail before synchronization"
 
